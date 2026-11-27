@@ -1,0 +1,13 @@
+{
+  "name": "shadow-savetube-mp3-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker MP3 link scraper for save-tube.com/youtube-music-downloader",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.99.0"
+  }
+}
