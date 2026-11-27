@@ -1,9 +1,9 @@
-// Enhanced save-tube.com JS bundle + endpoint inspector worker
+// Fast cached ytmp3.gl MP3 + Document payload scraper worker (/health, /mp3, /dl, /ytmp3)
 
 const CREATOR = "👨‍💻 SHADOW MOVIE X MAIN OWNER 👨‍💻";
-const TOOL_URL = "https://save-tube.com/youtube-music-downloader/";
-const ORIGIN_URL = "https://save-tube.com";
-const CACHE_TTL_SEC = 300;
+const TOOL_URL = "https://ytmp3.gl/";
+const ORIGIN_URL = "https://ytmp3.gl";
+const CACHE_TTL_SEC = 600; // 10 minutes cache
 
 const BASE_HEADERS = {
   "User-Agent":
@@ -84,7 +84,13 @@ function absUrl(raw, base = ORIGIN_URL) {
   }
 }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+function isChallengeHtml(html = "") {
+  return /__cf_chl_|cf-browser-verification|just a moment\.\.\.|checking your browser before accessing/i.test(
+    html
+  );
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 7000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
@@ -100,16 +106,17 @@ function extractScriptUrls(html = "") {
     const full = absUrl(m[1], ORIGIN_URL);
     if (full && !full.includes("googletagmanager") && !full.includes("google-analytics")) {
       scripts.add(full);
+      if (scripts.size >= 6) break;
     }
   }
-  return [...scripts].slice(0, 6);
+  return [...scripts];
 }
 
 function extractEndpointsFromJs(jsText = "") {
   const found = new Set();
 
   for (const m of jsText.matchAll(
-    /https?:\/\/[a-zA-Z0-9.-]+(?:save-tube|savetube|yt|tube|convert|dl|api|cdn|media)[a-zA-Z0-9./?=&_-]*/gi
+    /https?:\/\/[a-zA-Z0-9.-]+(?:ytmp3|mp3|convert|dl|download|api|cdn|media|tube)[a-zA-Z0-9./?=&_-]*/gi
   )) {
     found.add(decodeHtml(m[0]));
     if (found.size >= 15) break;
@@ -155,7 +162,7 @@ function collectDownloadCandidates(text = "") {
   return [...found];
 }
 
-async function scrapeSaveTubeMp3(inputUrl) {
+async function scrapeYtmp3Gl(inputUrl) {
   const ytUrl = normalizeYouTubeUrl(inputUrl);
   const videoId = extractYouTubeId(ytUrl);
 
@@ -166,17 +173,20 @@ async function scrapeSaveTubeMp3(inputUrl) {
       redirect: "follow",
       cf: { cacheTtl: CACHE_TTL_SEC, cacheEverything: true },
     },
-    8000
+    7000
   );
 
   const pageHtml = await pageRes.text();
-  if (!pageRes.ok) {
+  if (!pageRes.ok || isChallengeHtml(pageHtml)) {
     return {
       ok: false,
       source: TOOL_URL,
       inputUrl: ytUrl,
       videoId,
-      error: `Failed to load save-tube page (HTTP ${pageRes.status})`,
+      cloudflareChallenge: isChallengeHtml(pageHtml),
+      error: isChallengeHtml(pageHtml)
+        ? "Blocked by Cloudflare challenge on ytmp3.gl"
+        : `Failed to load ytmp3.gl (HTTP ${pageRes.status})`,
     };
   }
 
@@ -202,7 +212,6 @@ async function scrapeSaveTubeMp3(inputUrl) {
   const discoveredEndpoints = new Set(extractEndpointsFromJs(pageHtml));
   const scriptUrls = extractScriptUrls(pageHtml);
 
-  // Fetch JS bundles in parallel to discover hidden API/download endpoints
   const jsContents = await Promise.all(
     scriptUrls.map(async (sUrl) => {
       try {
@@ -229,10 +238,10 @@ async function scrapeSaveTubeMp3(inputUrl) {
   for (const ep of endpointsList) {
     if (!/^https?:\/\//i.test(ep)) continue;
 
-    // Try GET with query params first
     try {
       const getUrl = new URL(ep);
       getUrl.searchParams.set("url", ytUrl);
+      getUrl.searchParams.set("v", videoId || "");
       getUrl.searchParams.set("format", "mp3");
       const gRes = await fetchWithTimeout(
         getUrl.toString(),
@@ -244,12 +253,25 @@ async function scrapeSaveTubeMp3(inputUrl) {
         for (const dl of collectDownloadCandidates(gText)) {
           candidates.add(dl);
         }
+        try {
+          const parsed = JSON.parse(gText);
+          if (parsed?.title && typeof parsed.title === "string") title = parsed.title.trim();
+          const direct =
+            parsed?.downloadUrl ||
+            parsed?.download_url ||
+            parsed?.mp3 ||
+            parsed?.url ||
+            parsed?.data?.downloadUrl ||
+            parsed?.data?.url;
+          if (typeof direct === "string" && /^https?:\/\//i.test(direct)) {
+            candidates.add(direct);
+          }
+        } catch (_) {}
       }
     } catch (_) {}
 
     if (candidates.size > 0) break;
 
-    // Try POST with JSON payload
     try {
       const pRes = await fetchWithTimeout(
         ep,
@@ -261,7 +283,13 @@ async function scrapeSaveTubeMp3(inputUrl) {
             Origin: ORIGIN_URL,
             Referer: TOOL_URL,
           },
-          body: JSON.stringify({ url: ytUrl, link: ytUrl, format: "mp3", quality: "128" }),
+          body: JSON.stringify({
+            url: ytUrl,
+            link: ytUrl,
+            videoId,
+            format: "mp3",
+            quality: "128",
+          }),
         },
         5000
       );
@@ -311,7 +339,7 @@ async function scrapeSaveTubeMp3(inputUrl) {
     discoveredEndpoints: endpointsList,
     note:
       mp3Links.length === 0
-        ? "Save-tube processes conversion via dynamic client/API flow; check discoveredEndpoints or test a direct MP3/audio API."
+        ? "No direct MP3 link found in static response from ytmp3.gl."
         : null,
   };
 }
@@ -351,7 +379,7 @@ export default {
             "BYPASS"
           );
         }
-        const data = await scrapeSaveTubeMp3(target);
+        const data = await scrapeYtmp3Gl(target);
         const resp = jsonRes(data, data.ok ? 200 : 502, "MISS");
         if (data.ok && ctx?.waitUntil) ctx.waitUntil(cache.put(cacheKey, resp.clone()));
         return resp;
