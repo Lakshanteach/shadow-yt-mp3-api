@@ -1,9 +1,9 @@
-// Fast cached ytmp3.gl MP3 + Document payload scraper worker (/health, /mp3, /dl, /ytmp3)
+// Clean ytmp3.gl scraper worker with strict junk/Google/YouTube URL filtering
 
 const CREATOR = "👨‍💻 SHADOW MOVIE X MAIN OWNER 👨‍💻";
 const TOOL_URL = "https://ytmp3.gl/";
 const ORIGIN_URL = "https://ytmp3.gl";
-const CACHE_TTL_SEC = 600; // 10 minutes cache
+const CACHE_TTL_SEC = 600;
 
 const BASE_HEADERS = {
   "User-Agent":
@@ -12,6 +12,23 @@ const BASE_HEADERS = {
     "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8",
   "Accept-Language": "en-US,en;q=0.9,si;q=0.8",
 };
+
+const BLOCKED_HOSTS = [
+  "accounts.google.com",
+  "google.com",
+  "www.google.com",
+  "youtube.com",
+  "www.youtube.com",
+  "music.youtube.com",
+  "youtu.be",
+  "www.gstatic.com",
+  "gstatic.com",
+  "i.ytimg.com",
+  "yt3.ggpht.com",
+  "ggpht.com",
+  "googletagmanager.com",
+  "google-analytics.com",
+];
 
 function jsonRes(payload, status = 200, cacheStatus = "MISS") {
   return new Response(
@@ -84,6 +101,41 @@ function absUrl(raw, base = ORIGIN_URL) {
   }
 }
 
+function isValidAudioDownloadUrl(candidate = "") {
+  const clean = decodeHtml(String(candidate || "").trim());
+  if (!/^https?:\/\//i.test(clean)) return false;
+
+  let u;
+  try {
+    u = new URL(clean);
+  } catch (_) {
+    return false;
+  }
+
+  const host = u.hostname.toLowerCase();
+  if (BLOCKED_HOSTS.some((b) => host === b || host.endsWith(`.${b}`))) {
+    return false;
+  }
+
+  const fullLower = clean.toLowerCase();
+  if (
+    fullLower.includes("servicelogin") ||
+    fullLower.includes("signin") ||
+    /\.(?:json|js|css|html|php|png|jpg|jpeg|webp|gif|svg|woff2?|ttf|map)(?:$|\?)/i.test(
+      u.pathname
+    )
+  ) {
+    return false;
+  }
+
+  return (
+    /\.mp3(?:$|\?)/i.test(u.pathname) ||
+    /\/(?:download|dl|mp3|audio|stream|getfile|convert)(?:\/|$|\?)/i.test(
+      u.pathname + u.search
+    )
+  );
+}
+
 function isChallengeHtml(html = "") {
   return /__cf_chl_|cf-browser-verification|just a moment\.\.\.|checking your browser before accessing/i.test(
     html
@@ -104,10 +156,13 @@ function extractScriptUrls(html = "") {
   const scripts = new Set();
   for (const m of html.matchAll(/<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/gi)) {
     const full = absUrl(m[1], ORIGIN_URL);
-    if (full && !full.includes("googletagmanager") && !full.includes("google-analytics")) {
+    if (!full) continue;
+    try {
+      const h = new URL(full).hostname.toLowerCase();
+      if (BLOCKED_HOSTS.some((b) => h === b || h.endsWith(`.${b}`))) continue;
       scripts.add(full);
       if (scripts.size >= 6) break;
-    }
+    } catch (_) {}
   }
   return [...scripts];
 }
@@ -118,17 +173,22 @@ function extractEndpointsFromJs(jsText = "") {
   for (const m of jsText.matchAll(
     /https?:\/\/[a-zA-Z0-9.-]+(?:ytmp3|mp3|convert|dl|download|api|cdn|media|tube)[a-zA-Z0-9./?=&_-]*/gi
   )) {
-    found.add(decodeHtml(m[0]));
-    if (found.size >= 15) break;
+    const cand = decodeHtml(m[0]);
+    try {
+      const h = new URL(cand).hostname.toLowerCase();
+      if (BLOCKED_HOSTS.some((b) => h === b || h.endsWith(`.${b}`))) continue;
+      found.add(cand);
+      if (found.size >= 12) break;
+    } catch (_) {}
   }
 
   for (const m of jsText.matchAll(
-    /["'`](\/(?:api\/|v\d+\/|ajax\/)?[a-zA-Z0-9_/-]*(?:convert|download|mp3|info|extract|process|task|status|yt|youtube|music)[a-zA-Z0-9_/-]*)["'`]/gi
+    /["'`](\/(?:api\/|v\d+\/|ajax\/)?[a-zA-Z0-9_/-]*(?:convert|download|mp3|info|extract|process|task|status)[a-zA-Z0-9_/-]*)["'`]/gi
   )) {
     const full = absUrl(m[1], ORIGIN_URL);
     if (full) {
       found.add(full);
-      if (found.size >= 15) break;
+      if (found.size >= 12) break;
     }
   }
 
@@ -139,22 +199,20 @@ function collectDownloadCandidates(text = "") {
   const decoded = decodeHtml(text);
   const found = new Set();
 
-  for (const m of decoded.matchAll(
-    /https?:\/\/[^\s"'<>\\)]+(?:\.mp3|\/download[^"'<>\\)\s]*|[?&](?:dl|download|mp3|audio|token|file)=[^\s"'<>\\)\s]+)/gi
-  )) {
-    found.add(m[0]);
-    if (found.size >= 8) break;
+  for (const m of decoded.matchAll(/https?:\/\/[^\s"'<>\\)]+/gi)) {
+    const cand = decodeHtml(m[0]);
+    if (isValidAudioDownloadUrl(cand)) {
+      found.add(cand);
+      if (found.size >= 8) break;
+    }
   }
 
   for (const m of decoded.matchAll(
     /"(?:download_?url|mp3_?url|audio_?url|stream_?url|download|link|url)"\s*:\s*"(https?:\/\/[^"]+)"/gi
   )) {
-    const candidate = decodeHtml(m[1]);
-    if (
-      /\.(?:mp3|m4a|ogg|opus|webm)/i.test(candidate) ||
-      /download|dl|convert|getfile|audio/i.test(candidate)
-    ) {
-      found.add(candidate);
+    const cand = decodeHtml(m[1]);
+    if (isValidAudioDownloadUrl(cand)) {
+      found.add(cand);
       if (found.size >= 8) break;
     }
   }
@@ -239,40 +297,6 @@ async function scrapeYtmp3Gl(inputUrl) {
     if (!/^https?:\/\//i.test(ep)) continue;
 
     try {
-      const getUrl = new URL(ep);
-      getUrl.searchParams.set("url", ytUrl);
-      getUrl.searchParams.set("v", videoId || "");
-      getUrl.searchParams.set("format", "mp3");
-      const gRes = await fetchWithTimeout(
-        getUrl.toString(),
-        { headers: { ...BASE_HEADERS, Referer: TOOL_URL } },
-        5000
-      );
-      const gText = await gRes.text();
-      if (gRes.ok && gText) {
-        for (const dl of collectDownloadCandidates(gText)) {
-          candidates.add(dl);
-        }
-        try {
-          const parsed = JSON.parse(gText);
-          if (parsed?.title && typeof parsed.title === "string") title = parsed.title.trim();
-          const direct =
-            parsed?.downloadUrl ||
-            parsed?.download_url ||
-            parsed?.mp3 ||
-            parsed?.url ||
-            parsed?.data?.downloadUrl ||
-            parsed?.data?.url;
-          if (typeof direct === "string" && /^https?:\/\//i.test(direct)) {
-            candidates.add(direct);
-          }
-        } catch (_) {}
-      }
-    } catch (_) {}
-
-    if (candidates.size > 0) break;
-
-    try {
       const pRes = await fetchWithTimeout(
         ep,
         {
@@ -308,7 +332,7 @@ async function scrapeYtmp3Gl(inputUrl) {
             parsed?.url ||
             parsed?.data?.downloadUrl ||
             parsed?.data?.url;
-          if (typeof direct === "string" && /^https?:\/\//i.test(direct)) {
+          if (typeof direct === "string" && isValidAudioDownloadUrl(direct)) {
             candidates.add(direct);
           }
         } catch (_) {}
@@ -339,7 +363,7 @@ async function scrapeYtmp3Gl(inputUrl) {
     discoveredEndpoints: endpointsList,
     note:
       mp3Links.length === 0
-        ? "No direct MP3 link found in static response from ytmp3.gl."
+        ? "No valid MP3 download link returned without browser JS/session flow on ytmp3.gl."
         : null,
   };
 }
